@@ -2,7 +2,7 @@
   "id": "mass-effect-shield-automation",
   "title": "Mass Effect Shield System",
   "description": "Automates a Mass Effect-style kinetic barrier system for Pathfinder 2e / Starfinder 2e. Shields regenerate each turn; depleted shields require the actor to Take Cover before recharging begins.",
-  "version": "1.0.0",
+  "version": "1.5.0",
   "authors": [
     { "name": "nscarpinatodev" }
   ],

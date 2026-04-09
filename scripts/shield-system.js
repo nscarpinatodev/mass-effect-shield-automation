@@ -6,14 +6,18 @@
 // ============================================================
 //
 // HOW IT WORKS:
-//   Each shielded actor carries a "Kinetic Shield" effect item.
-//   The effect stores two module flags:
+//   Shields and mods are equipment items installed on armor. The equipment items
+//   carry module flags directly and are detected by the hooks below. For PCs,
+//   items must be equipped (worn/installed) to be active. For NPCs, all items in
+//   inventory are treated as active since NPCs have no equip/unequip UI.
+//
+//   Equipment items carry the module flags:
 //     • mass-effect-shields.shieldMax   — maximum shield HP
 //     • mass-effect-shields.shieldRegen — HP restored per turn
+//     • mass-effect-shields.shieldHpBonus — flat HP bonus from HP mods
+//     • mass-effect-shields.regenMult   — regen multiplier from regen mods
 //
-//   The module uses the actor's Temp HP field as the current
-//   shield value. No rule elements are used — this module
-//   manages the value directly.
+//   The module uses the actor's Temp HP field as the current shield value.
 //
 // TURN-START LOGIC:
 //   tempHP > 0  → regen by shieldRegen (cap at shieldMax)
@@ -53,26 +57,63 @@ Hooks.once('init', () => {
     default: 'effect-cover',
   });
 
+  // Hidden — tracks which module version last synced the world-item templates.
+  // When the version changes, effects are automatically recreated on next load.
+  game.settings.register(MODULE_ID, 'lastSyncedVersion', {
+    scope: 'world',
+    config: false,
+    type: String,
+    default: '',
+  });
 });
 
 // ── READY ─────────────────────────────────────────────────────────────────────
 
-Hooks.once('ready', () => {
+Hooks.once('ready', async () => {
   const version = game.modules.get(MODULE_ID)?.version ?? '?';
   console.log(`ME Shields | Mass Effect Shield System v${version} loaded.`);
+  if (game.user.isGM) await syncEffects(version);
 });
 
 // ── EFFECT LIFECYCLE ──────────────────────────────────────────────────────────
 
-// When a shield or barrier effect is applied to an actor, initialise its HP.
+// When a shield or mod item is applied to an actor, initialise the appropriate values.
 Hooks.on('createItem', async (item, _options, _userId) => {
   if (!game.user.isGM) return;
   const actor = item.parent;
   if (!actor) return;
 
   if (isShieldEffect(item)) {
-    const max = item.getFlag(MODULE_ID, 'shieldMax') ?? 0;
-    if (max > 0) await actor.update({ 'system.attributes.hp.temp': max });
+    const baseMax  = item.getFlag(MODULE_ID, 'shieldMax') ?? 0;
+    const hpMod    = getShieldHpMod(actor);
+    const hpBonus  = hpMod ? (hpMod.getFlag(MODULE_ID, 'shieldHpBonus') ?? 0) : 0;
+    const effectiveMax = baseMax + hpBonus;
+    if (effectiveMax > 0) await actor.update({ 'system.attributes.hp.temp': effectiveMax });
+    return;
+  }
+
+  if (isShieldHpMod(item)) {
+    // Remove any pre-existing HP mod (only one can be active at a time).
+    for (const e of [...(actor.itemTypes?.equipment ?? []), ...(actor.itemTypes?.effect ?? [])]
+        .filter(e => isShieldHpMod(e) && e.id !== item.id)) {
+      await e.delete();
+    }
+    const shield = getShieldEffect(actor);
+    if (shield) {
+      const baseMax  = shield.getFlag(MODULE_ID, 'shieldMax') ?? 0;
+      const hpBonus  = item.getFlag(MODULE_ID, 'shieldHpBonus') ?? 0;
+      const effectiveMax = baseMax + hpBonus;
+      if (effectiveMax > 0) await actor.update({ 'system.attributes.hp.temp': effectiveMax });
+    }
+    return;
+  }
+
+  if (isRegenMod(item)) {
+    // Remove any pre-existing regen mod (only one can be active at a time).
+    for (const e of [...(actor.itemTypes?.equipment ?? []), ...(actor.itemTypes?.effect ?? [])]
+        .filter(e => isRegenMod(e) && e.id !== item.id)) {
+      await e.delete();
+    }
     return;
   }
 
@@ -81,18 +122,48 @@ Hooks.on('createItem', async (item, _options, _userId) => {
     for (const e of actor.itemTypes.effect.filter(e => isBioticBarrier(e) && e.id !== item.id)) {
       await e.delete();
     }
-    const max = item.getFlag(MODULE_ID, 'barrierMax') ?? 0;
-    if (max > 0) await item.setFlag(MODULE_ID, 'barrierCurrent', max);
+
+    // If barrierMax is already set (old-style tier item), use it;
+    // otherwise compute from actor level: 5 × floor(level / 2), minimum 5.
+    const existingMax = item.getFlag(MODULE_ID, 'barrierMax');
+    const level = actor.level ?? 1;
+    const max = existingMax ?? Math.max(5, 5 * Math.floor(level / 2));
+
+    await item.update({
+      [`flags.${MODULE_ID}.barrierMax`]:     max,
+      [`flags.${MODULE_ID}.barrierCurrent`]: max,
+      'system.badge': { type: 'counter', value: max, max },
+    });
   }
 });
 
-// When a shield effect is removed, clear Temp HP.
 Hooks.on('deleteItem', async (item, _options, _userId) => {
   if (!game.user.isGM) return;
-  if (!isShieldEffect(item)) return;
   const actor = item.parent;
   if (!actor) return;
-  await actor.update({ 'system.attributes.hp.temp': 0 });
+
+  if (isShieldEffect(item)) {
+    // Pass shieldRemoval so preUpdateActor doesn't treat the tempHP drop as incoming damage.
+    await actor.update(
+      { 'system.attributes.hp.temp': 0 },
+      { [MODULE_ID]: { shieldRemoval: true } }
+    );
+    return;
+  }
+
+  if (isShieldHpMod(item)) {
+    const shield = getShieldEffect(actor);
+    if (shield) {
+      const baseMax     = shield.getFlag(MODULE_ID, 'shieldMax') ?? 0;
+      const currentTemp = actor.system.attributes.hp.temp ?? 0;
+      if (currentTemp > baseMax) {
+        await actor.update(
+          { 'system.attributes.hp.temp': baseMax },
+          { [MODULE_ID]: { shieldRemoval: true } }
+        );
+      }
+    }
+  }
 });
 
 // ── DAMAGE ROUTING ────────────────────────────────────────────────────────────
@@ -103,6 +174,8 @@ Hooks.on('deleteItem', async (item, _options, _userId) => {
 
 Hooks.on('preUpdateActor', (actor, changes, options, _userId) => {
   if (!game.user.isGM) return;
+  // Skip damage routing when we're intentionally clearing tempHP (shield removed/unequipped).
+  if (options?.[MODULE_ID]?.shieldRemoval) return;
 
   const barrier = getBioticBarrier(actor);
   const shield  = getShieldEffect(actor);
@@ -114,65 +187,85 @@ Hooks.on('preUpdateActor', (actor, changes, options, _userId) => {
   const newHP   = foundry.utils.getProperty(changes, 'system.attributes.hp.value') ?? currentHP;
   const newTemp = foundry.utils.getProperty(changes, 'system.attributes.hp.temp') ?? currentTemp;
 
-  const totalDamage = Math.max(0, (currentHP - newHP) + (currentTemp - newTemp));
-  if (totalDamage <= 0) return;
+  const derivedDamage = Math.max(0, (currentHP - newHP) + (currentTemp - newTemp));
+  if (derivedDamage <= 0) return;
 
-  // ── Step 2: detect lightning damage type ────────────────────────────────
-  // PF2e passes damage context in options — log it once so we can confirm
-  // the correct key if lightning detection needs adjustment.
-  console.log('ME Shields | preUpdateActor options:', JSON.stringify(options ?? {}));
-  const damageTypes = options?.pf2e?.context?.damageTypes
-    ?? options?.pf2e?.damageTypes
-    ?? options?.pf2e?.context?.traits
-    ?? [];
-  const isLightning = Array.isArray(damageTypes) && damageTypes.includes('electricity');
-  if (isLightning) console.log('ME Shields | Lightning damage detected — shields take double damage');
+  // PF2e caps HP at 0, so if the hit would overkill, derivedDamage is lower
+  // than the real roll. options.damageTaken reflects the true damage figure.
+  const reportedDamage = options?.damageTaken ?? null;
+  const totalDamage    = reportedDamage ?? derivedDamage;
+
+  // ── Step 2: detect electricity damage ───────────────────────────────────
+  const isElectricity = isShockWeaponAttack();
+
+  // ── Pre-calculation state log ────────────────────────────────────────────
+  const barrierHPBefore = barrier ? (barrier.getFlag(MODULE_ID, 'barrierCurrent') ?? 0) : null;
+  const barrierMax      = barrier ? (barrier.getFlag(MODULE_ID, 'barrierMax')     ?? 0) : null;
+  const shieldBaseMax   = shield?.getFlag(MODULE_ID, 'shieldMax') ?? 0;
+  const shieldHpMod     = shield ? getShieldHpMod(actor) : null;
+  const shieldHpBonus   = shieldHpMod ? (shieldHpMod.getFlag(MODULE_ID, 'shieldHpBonus') ?? 0) : 0;
+  const shieldMax       = shieldBaseMax + shieldHpBonus;
+
+  console.group(`ME Shields | [${actor.name}] Damage Routing`);
+  console.log(`  PRE-STATE    barrier: ${barrierHPBefore ?? 'none'}  shields: ${currentTemp}/${shieldMax}${shieldHpBonus ? ` (base ${shieldBaseMax} +${shieldHpBonus})` : ''}  HP: ${currentHP}`);
+  console.log(`  DAMAGE       PF2e reported: ${reportedDamage ?? '(not set)'}  derived from deltas: ${derivedDamage}  using: ${totalDamage}${reportedDamage !== null && reportedDamage !== derivedDamage ? '  ⚠ difference due to HP cap (overkill)' : ''}`);
+  console.log(`  FLAGS        electricity: ${isElectricity}`);
 
   // ── Step 3: barrier absorption ───────────────────────────────────────────
   let overflow = totalDamage;
-  if (barrier) {
-    const barrierCurrent = barrier.getFlag(MODULE_ID, 'barrierCurrent') ?? 0;
-    if (barrierCurrent > 0) {
-      const barrierAbsorbs = Math.min(barrierCurrent, overflow);
-      overflow -= barrierAbsorbs;
-      const newBarrier = barrierCurrent - barrierAbsorbs;
-      barrier.setFlag(MODULE_ID, 'barrierCurrent', newBarrier); // fire-and-forget
-      if (newBarrier === 0) {
-        barrier.delete();
-        postChat(actor, barrierDepletedHtml());
-      }
+  if (barrier && barrierHPBefore > 0) {
+    const barrierAbsorbs = Math.min(barrierHPBefore, overflow);
+    overflow -= barrierAbsorbs;
+    const newBarrier = barrierHPBefore - barrierAbsorbs;
+    console.log(`  BARRIER      absorbs ${barrierAbsorbs}  (${barrierHPBefore} → ${newBarrier})  overflow after: ${overflow}`);
+    barrier.setFlag(MODULE_ID, 'barrierCurrent', newBarrier); // fire-and-forget
+    if (newBarrier > 0) {
+      barrier.update({ 'system.badge': { type: 'counter', value: newBarrier, max: barrierMax } }); // fire-and-forget
+    } else {
+      barrier.delete();
+      postChat(actor, barrierDepletedHtml());
     }
+  } else if (barrier) {
+    console.log(`  BARRIER      at 0 HP — no absorption`);
   }
 
   // ── Step 4: shield-specific rules ───────────────────────────────────────
-  const shieldMax = shield?.getFlag(MODULE_ID, 'shieldMax') ?? 0;
-
-  // Damage reaching the shield layer (before special rules).
   const rawShieldDamage = Math.min(overflow, currentTemp);
 
-  // Lightning: shields absorb double the normal amount, HP overflow unchanged.
-  const effectiveShieldDamage = isLightning
+  // Electricity: double the effective damage against shields.
+  const effectiveShieldDamage = isElectricity
     ? Math.min(rawShieldDamage * 2, currentTemp)
     : rawShieldDamage;
 
-  // Massive damage collapse: a single hit dealing more than half shield max
-  // instantly drops shields to 0, even if they would have survived.
+  // Massive damage collapse: a single hit exceeding half shield max collapses
+  // the shields. When collapsed, the shield only absorbs up to the threshold
+  // (shieldMax/2) — all damage above the threshold goes directly to actor HP.
   const massiveThreshold = shieldMax / 2;
   const isCollapse = shield && currentTemp > 0
     && effectiveShieldDamage > massiveThreshold;
 
-  const finalShieldHP = isCollapse ? 0 : Math.max(0, currentTemp - effectiveShieldDamage);
+  const shieldAbsorbs = isCollapse
+    ? Math.ceil(massiveThreshold)                          // round up so no half-HP bleed-through
+    : rawShieldDamage;                                     // normal absorption up to current HP
+  const finalShieldHP = isCollapse
+    ? 0
+    : Math.max(0, currentTemp - rawShieldDamage);
+  const hpDamage = Math.max(0, Math.floor(overflow - shieldAbsorbs)); // everything above threshold hits HP
 
-  // HP overflow uses original (non-doubled) overflow so lightning doesn't
-  // also double damage to actual HP.
-  const hpDamage = Math.max(0, overflow - currentTemp);
+  if (shield) {
+    console.log(`  SHIELDS      current: ${currentTemp}/${shieldMax}  threshold: ${massiveThreshold}  raw hit: ${rawShieldDamage}${isElectricity ? `  ×2 = ${effectiveShieldDamage}` : ''}  collapse: ${isCollapse}  absorbed: ${shieldAbsorbs}  shields after: ${finalShieldHP}`);
+  } else {
+    console.log(`  SHIELDS      none`);
+  }
+  console.log(`  HP           overflow to HP: ${hpDamage}  HP after: ${currentHP} → ${currentHP - hpDamage}`);
 
   // ── Step 5: rewrite the changes ─────────────────────────────────────────
   foundry.utils.setProperty(changes, 'system.attributes.hp.temp',  finalShieldHP);
-  foundry.utils.setProperty(changes, 'system.attributes.hp.value', currentHP - hpDamage);
+  foundry.utils.setProperty(changes, 'system.attributes.hp.value', Math.max(0, currentHP - hpDamage));
+  console.groupEnd();
 
   // ── Step 6: post messages ────────────────────────────────────────────────
-  if (isLightning && shield && rawShieldDamage > 0) {
+  if (isElectricity && shield && rawShieldDamage > 0) {
     postChat(actor, lightningShieldHtml(effectiveShieldDamage, currentTemp, finalShieldHP, shieldMax));
   }
   if (isCollapse) {
@@ -216,27 +309,35 @@ Hooks.on('pf2e.startTurn', async (first, second) => {
     return;
   }
 
+  const parts = [];
+
   // ── Shield handling ────────────────────────────────────────────────────────
   if (shield) {
     console.log(`ME Shields | Shield effect found: "${shield.name}"`);
 
-    const max     = shield.getFlag(MODULE_ID, 'shieldMax')   ?? 0;
-    const regen   = shield.getFlag(MODULE_ID, 'shieldRegen') ?? 0;
-    const current = actor.system.attributes.hp.temp ?? 0;
-    console.log(`ME Shields | max=${max} regen=${regen} current tempHP=${current}`);
+    const baseMax   = shield.getFlag(MODULE_ID, 'shieldMax')   ?? 0;
+    const baseRegen = shield.getFlag(MODULE_ID, 'shieldRegen') ?? 0;
+    const hpMod     = getShieldHpMod(actor);
+    const hpBonus   = hpMod ? (hpMod.getFlag(MODULE_ID, 'shieldHpBonus') ?? 0) : 0;
+    const max       = baseMax + hpBonus;
+    const regenMod  = getRegenMod(actor);
+    const mult      = regenMod ? (regenMod.getFlag(MODULE_ID, 'regenMult') ?? 1) : 1;
+    const regen     = Math.round(baseRegen * mult);
+    const current   = actor.system.attributes.hp.temp ?? 0;
+    console.log(`ME Shields | baseMax=${baseMax} hpBonus=${hpBonus} max=${max} baseRegen=${baseRegen} mult=${mult} regen=${regen} current tempHP=${current}`);
 
-    if (max === 0 || regen === 0) {
-      console.warn(`ME Shields | Shield flags missing or zero — max=${max}, regen=${regen}. Were the effects created with createShieldEffects()?`);
+    if (baseMax === 0 || baseRegen === 0) {
+      console.warn(`ME Shields | Shield flags missing or zero — baseMax=${baseMax}, baseRegen=${baseRegen}. Were the effects created with createShieldEffects()?`);
     } else if (current > 0) {
       if (current >= max) {
         console.log('ME Shields | Shields already full — posting status');
-        postChat(actor, fullHtml(max));
+        parts.push(fullHtml(max));
       } else {
         const newTemp  = Math.min(current + regen, max);
         const restored = newTemp - current;
         console.log(`ME Shields | Recharging: ${current} → ${newTemp} (+${restored})`);
         await actor.update({ 'system.attributes.hp.temp': newTemp });
-        postChat(actor, rechargeHtml(newTemp, max, restored));
+        parts.push(rechargeHtml(newTemp, max, restored));
       }
     } else {
       const inCover = hasTakeCover(actor);
@@ -245,10 +346,10 @@ Hooks.on('pf2e.startTurn', async (first, second) => {
         const newTemp = Math.min(regen, max);
         console.log(`ME Shields | Cover taken — restoring to ${newTemp}`);
         await actor.update({ 'system.attributes.hp.temp': newTemp });
-        postChat(actor, restoringHtml(newTemp, max));
+        parts.push(restoringHtml(newTemp, max));
       } else {
         console.log('ME Shields | No cover — shields remain offline');
-        postChat(actor, offlineHtml(max));
+        parts.push(offlineHtml(max));
       }
     }
   }
@@ -264,29 +365,78 @@ Hooks.on('pf2e.startTurn', async (first, second) => {
       console.log('ME Shields | Barrier at 0 HP — removing effect');
       await barrier.delete();
     } else {
-      postChat(actor, barrierStatusHtml(barrierCurrent, barrierMax));
+      parts.push(barrierStatusHtml(barrierCurrent, barrierMax));
     }
   }
+
+  // ── Post combined message ─────────────────────────────────────────────────
+  if (parts.length > 0) postChat(actor, parts.join(''));
 });
 
 // ── HELPERS ───────────────────────────────────────────────────────────────────
 
 function isShieldEffect(item) {
-  return item.type === 'effect'
-    && item.flags?.[MODULE_ID]?.shieldMax != null;
+  return item.flags?.[MODULE_ID]?.shieldMax != null
+    && (item.type === 'equipment' || item.type === 'effect');
 }
 
 function getShieldEffect(actor) {
-  return actor?.itemTypes?.effect?.find(isShieldEffect) ?? null;
+  return actor?.itemTypes?.equipment?.find(isShieldEffect)
+    ?? actor?.itemTypes?.effect?.find(isShieldEffect)
+    ?? null;
 }
 
 function isBioticBarrier(item) {
   return item.type === 'effect'
-    && item.flags?.[MODULE_ID]?.barrierMax != null;
+    && (item.flags?.[MODULE_ID]?.barrier === true
+        || item.flags?.[MODULE_ID]?.barrierMax != null);
 }
 
 function getBioticBarrier(actor) {
   return actor?.itemTypes?.effect?.find(isBioticBarrier) ?? null;
+}
+
+function isRegenMod(item) {
+  return item.flags?.[MODULE_ID]?.regenMult != null
+    && (item.type === 'equipment' || item.type === 'effect');
+}
+
+function getRegenMod(actor) {
+  return actor?.itemTypes?.equipment?.find(isRegenMod)
+    ?? actor?.itemTypes?.effect?.find(isRegenMod)
+    ?? null;
+}
+
+function isShieldHpMod(item) {
+  return item.flags?.[MODULE_ID]?.shieldHpBonus != null
+    && (item.type === 'equipment' || item.type === 'effect');
+}
+
+function getShieldHpMod(actor) {
+  return actor?.itemTypes?.equipment?.find(isShieldHpMod)
+    ?? actor?.itemTypes?.effect?.find(isShieldHpMod)
+    ?? null;
+}
+
+
+// Check whether the most recent PF2e damage roll came from a Shock-group weapon.
+// PF2e populates context.options with roll tags including "item:group:shock",
+// which is the most direct way to detect shock/electricity damage.
+function isShockWeaponAttack() {
+  const recent = [...game.messages.contents].slice(-10).reverse();
+  for (const msg of recent) {
+    const pf2e = msg.flags?.pf2e;
+    if (!pf2e) continue;
+    if (pf2e.context?.type !== 'damage-roll') continue;
+
+    const options = pf2e.context?.options ?? [];
+    const isElec = options.includes('item:damage:type:electricity');
+    console.log(`ME Shields | Damage roll detected — electricity damage: ${isElec}`);
+    return isElec;
+  }
+
+  console.log('ME Shields | No damage-roll message found in recent chat');
+  return false;
 }
 
 function hasTakeCover(actor) {
@@ -334,7 +484,7 @@ function shieldBar(current, max, color) {
 
 function card(color, body) {
   return `<div style="border-left:3px solid ${color};padding:5px 10px;`
-    + `background:${color}18;border-radius:2px;font-size:0.95em;">${body}</div>`;
+    + `background:${color}18;border-radius:2px;font-size:0.95em;margin-top:4px;">${body}</div>`;
 }
 
 function fullHtml(max) {
@@ -398,68 +548,61 @@ function barrierDepletedHtml() {
   );
 }
 
-// ── EFFECT CREATION UTILITY ───────────────────────────────────────────────────
+// ── ITEM CREATION UTILITIES ───────────────────────────────────────────────────
 //
-// Run from the Foundry browser console to create all tiered shield effects:
+// Run from the Foundry browser console:
+//   MassEffectShields.createShieldEffects()       — base shield
+//   MassEffectShields.createShieldHpModEffects()  — HP upgrade mods
+//   MassEffectShields.createRegenModEffects()     — regen upgrade mods
+//   MassEffectShields.createBarrierEffects()      — biotic barrier effect
 //
-//   MassEffectShields.createShieldEffects()
+// Or recreate everything at once:
+//   MassEffectShields.sync(true)
 //
-// Effects are created in a new "Mass Effect Shields" folder in your world Items.
-// Drag the appropriate tier onto any actor to give them a kinetic barrier.
-
-const SHIELD_TIERS = [
-  { tier: 1, name: 'Kinetic Shield — Tier 1', max: 20,  regen: 5  },
-  { tier: 2, name: 'Kinetic Shield — Tier 2', max: 35,  regen: 8  },
-  { tier: 3, name: 'Kinetic Shield — Tier 3', max: 50,  regen: 12 },
-  { tier: 4, name: 'Kinetic Shield — Tier 4', max: 70,  regen: 16 },
-  { tier: 5, name: 'Kinetic Shield — Tier 5', max: 100, regen: 22 },
-];
+// Drag the appropriate item onto an actor's sheet to equip it.
 
 async function createShieldEffects() {
   if (!game.user.isGM) {
     return ui.notifications.warn('ME Shields | Only the GM can create shield effects.');
   }
 
-  const folder = await Folder.create({
-    name: 'Mass Effect Shields',
-    type: 'Item',
-    color: '#4fc3f7',
-  });
-
-  for (const tier of SHIELD_TIERS) {
-    await Item.create({
-      name: tier.name,
-      type: 'effect',
-      img: 'icons/magic/defensive/shield-barrier-blue.webp',
-      folder: folder.id,
-      flags: {
-        [MODULE_ID]: {
-          shieldMax:   tier.max,
-          shieldRegen: tier.regen,
-        },
-      },
-      system: {
-        slug: `me-kinetic-shield-t${tier.tier}`,
-        description: {
-          value:
-            `<p>A kinetic barrier providing <strong>${tier.max} Shield HP</strong>.`
-            + ` Recharges <strong>${tier.regen} HP per turn</strong>.</p>`
-            + `<p>If fully depleted, the wearer must <strong>Take Cover</strong>`
-            + ` before the shield will begin recharging.</p>`,
-        },
-        duration: {
-          value:  -1,
-          unit:   'unlimited',
-          expiry: null,
-        },
-        rules: [],
-      },
-    });
+  let folder = game.folders.find(f => f.name === 'Mass Effect Shields' && f.type === 'Item');
+  if (!folder) {
+    folder = await Folder.create({ name: 'Mass Effect Shields', type: 'Item', color: '#4fc3f7' });
   }
 
-  ui.notifications.info(
-    `ME Shields | Created ${SHIELD_TIERS.length} shield effects in your Items directory.`
-  );
+  await Item.create({
+    name: 'Kinetic Shield',
+    type: 'equipment',
+    img: 'icons/magic/defensive/shield-barrier-blue.webp',
+    folder: folder.id,
+    flags: {
+      [MODULE_ID]: {
+        shieldMax:   30,
+        shieldRegen: 10,
+      },
+    },
+    system: {
+      slug: 'me-kinetic-shield',
+      description: {
+        value:
+          `<p>A personal kinetic barrier providing <strong>30 Shield HP</strong>.`
+          + ` Recharges <strong>10 HP per turn</strong>.</p>`
+          + `<p>Equip <strong>Shield HP</strong> and <strong>Regen</strong> mods to`
+          + ` upgrade your barrier. If fully depleted, the wearer must`
+          + ` <strong>Take Cover</strong> before the shield will begin recharging.</p>`,
+      },
+      level:   { value: 1 },
+      price:   { value: { sp: 150 } },
+      bulk:    { value: 1 },
+      equipped: { carryType: 'worn', inSlot: true },
+      usage:   { value: 'other' },
+      traits:  { value: [], rarity: 'common' },
+      rules:   [],
+    },
+  });
+
+  ui.notifications.info('ME Shields | Created Kinetic Shield item in your Items directory.');
 }
 
 // ── BARRIER CREATION UTILITY ──────────────────────────────────────────────────
@@ -467,63 +610,198 @@ async function createShieldEffects() {
 // Run from the Foundry browser console:
 //   MassEffectShields.createBarrierEffects()
 //
-// Creates tiered biotic barrier effects based on the formula: 5 × floor(level / 2).
-// Drag the appropriate tier onto any actor to give them a biotic barrier.
+// Creates a single "Biotic Barrier" effect item. When dragged onto an actor,
+// the barrier HP is calculated automatically from the actor's level (5 × ⌊level ÷ 2⌋).
 // Barriers activate at full strength and do not regen per turn.
-
-const BARRIER_TIERS = [
-  { tier: 1, name: 'Biotic Barrier — Tier 1', levelEquiv: 2,  max: 5  },
-  { tier: 2, name: 'Biotic Barrier — Tier 2', levelEquiv: 4,  max: 10 },
-  { tier: 3, name: 'Biotic Barrier — Tier 3', levelEquiv: 6,  max: 15 },
-  { tier: 4, name: 'Biotic Barrier — Tier 4', levelEquiv: 8,  max: 20 },
-  { tier: 5, name: 'Biotic Barrier — Tier 5', levelEquiv: 10, max: 25 },
-  { tier: 6, name: 'Biotic Barrier — Tier 6', levelEquiv: 12, max: 30 },
-];
 
 async function createBarrierEffects() {
   if (!game.user.isGM) {
     return ui.notifications.warn('ME Shields | Only the GM can create barrier effects.');
   }
 
-  const folder = await Folder.create({
-    name: 'Mass Effect Barriers',
-    type: 'Item',
-    color: '#ce93d8',
+  let folder = game.folders.find(f => f.name === 'Mass Effect Barriers' && f.type === 'Item');
+  if (!folder) {
+    folder = await Folder.create({ name: 'Mass Effect Barriers', type: 'Item', color: '#ce93d8' });
+  }
+
+  await Item.create({
+    name: 'Biotic Barrier',
+    type: 'effect',
+    img: 'icons/magic/lightning/barrier-shield-crackling-orb-pink.webp',
+    folder: folder.id,
+    flags: {
+      [MODULE_ID]: {
+        barrier: true,   // marker flag; barrierMax is set dynamically at application
+      },
+    },
+    system: {
+      slug: 'me-biotic-barrier',
+      description: {
+        value:
+          `<p>A biotic barrier. HP = 5 × ⌊level ÷ 2⌋, calculated at activation.</p>`
+          + `<p>Absorbs damage before shields and actual HP. Does not recharge per`
+          + ` turn — spend actions to reactivate at full strength.</p>`,
+      },
+      duration: {
+        value:  -1,
+        unit:   'unlimited',
+        expiry: null,
+      },
+      rules: [],
+    },
   });
 
-  for (const tier of BARRIER_TIERS) {
+  ui.notifications.info('ME Shields | Created Biotic Barrier effect in your Items directory.');
+}
+
+const SHIELD_HP_MOD_TIERS = [
+  { tier: 1, bonus: 10, level: 3,  price: 600,   name: 'Shield HP Mod — Tier 1' },
+  { tier: 2, bonus: 20, level: 6,  price: 2500,  name: 'Shield HP Mod — Tier 2' },
+  { tier: 3, bonus: 40, level: 9,  price: 7000,  name: 'Shield HP Mod — Tier 3' },
+  { tier: 4, bonus: 70, level: 12, price: 16000, name: 'Shield HP Mod — Tier 4' },
+];
+
+async function createShieldHpModEffects() {
+  if (!game.user.isGM) {
+    return ui.notifications.warn('ME Shields | Only the GM can create HP mod effects.');
+  }
+
+  let folder = game.folders.find(f => f.name === 'Mass Effect Mods' && f.type === 'Item');
+  if (!folder) {
+    folder = await Folder.create({ name: 'Mass Effect Mods', type: 'Item', color: '#80cbc4' });
+  }
+
+  for (const mod of SHIELD_HP_MOD_TIERS) {
     await Item.create({
-      name: tier.name,
-      type: 'effect',
-      img: 'icons/magic/light/orb-lightball-blue-purple-pink.webp',
+      name: mod.name,
+      type: 'equipment',
+      img: 'icons/magic/defensive/shield-barrier-glowing-blue.webp',
       folder: folder.id,
       flags: {
-        [MODULE_ID]: {
-          barrierMax: tier.max,
-        },
+        [MODULE_ID]: { shieldHpBonus: mod.bonus },
       },
       system: {
-        slug: `me-biotic-barrier-t${tier.tier}`,
+        slug: `me-shield-hp-mod-t${mod.tier}`,
         description: {
           value:
-            `<p>A biotic barrier providing <strong>${tier.max} Barrier HP</strong>`
-            + ` (character level ~${tier.levelEquiv}, formula: 5 × ⌊level ÷ 2⌋).</p>`
-            + `<p>Barriers absorb damage before shields and actual HP. They do not`
-            + ` recharge per turn — spend actions to reactivate at full strength.</p>`,
+            `<p>A Tier ${mod.tier} armor modification that increases kinetic shield`
+            + ` capacity by <strong>+${mod.bonus} HP</strong>`
+            + ` (base 30 → ${30 + mod.bonus}).</p>`
+            + `<p>Only one Shield HP Mod can be installed at a time.</p>`,
         },
-        duration: {
-          value:  -1,
-          unit:   'unlimited',
-          expiry: null,
-        },
-        rules: [],
+        level:   { value: mod.level },
+        price:   { value: { sp: mod.price } },
+        bulk:    { value: 0 },
+        size:    'tiny',
+        equipped: { carryType: 'worn', inSlot: true },
+        usage:   { value: 'other' },
+        traits:  { value: [], rarity: 'common' },
+        rules:   [],
       },
     });
   }
 
   ui.notifications.info(
-    `ME Shields | Created ${BARRIER_TIERS.length} barrier effects in your Items directory.`
+    `ME Shields | Created ${SHIELD_HP_MOD_TIERS.length} Shield HP Mod items in your Items directory.`
   );
+}
+
+// ── REGEN MOD CREATION UTILITY ───────────────────────────────────────────────
+//
+// Run from the Foundry browser console:
+//   MassEffectShields.createRegenModEffects()
+//
+// Creates 4 armor modification effects that multiply shield regen.
+// Only one mod can be active on an actor at a time — applying a new one removes the old.
+
+const REGEN_MOD_TIERS = [
+  { tier: 1, pct: 50,  mult: 1.5, level: 3,  price: 600,   name: 'Shield Regen Mod — Tier 1' },
+  { tier: 2, pct: 100, mult: 2.0, level: 6,  price: 2500,  name: 'Shield Regen Mod — Tier 2' },
+  { tier: 3, pct: 150, mult: 2.5, level: 9,  price: 7000,  name: 'Shield Regen Mod — Tier 3' },
+  { tier: 4, pct: 200, mult: 3.0, level: 12, price: 16000, name: 'Shield Regen Mod — Tier 4' },
+];
+
+async function createRegenModEffects() {
+  if (!game.user.isGM) {
+    return ui.notifications.warn('ME Shields | Only the GM can create regen mod effects.');
+  }
+
+  let folder = game.folders.find(f => f.name === 'Mass Effect Mods' && f.type === 'Item');
+  if (!folder) {
+    folder = await Folder.create({ name: 'Mass Effect Mods', type: 'Item', color: '#80cbc4' });
+  }
+
+  for (const mod of REGEN_MOD_TIERS) {
+    await Item.create({
+      name: mod.name,
+      type: 'equipment',
+      img: 'icons/magic/defensive/shield-barrier-flaming-diamond-blue-yellow.webp',
+      folder: folder.id,
+      flags: {
+        [MODULE_ID]: { regenMult: mod.mult },
+      },
+      system: {
+        slug: `me-shield-regen-mod-t${mod.tier}`,
+        description: {
+          value:
+            `<p>A Tier ${mod.tier} armor modification that boosts kinetic shield`
+            + ` recharge rate by <strong>+${mod.pct}%</strong>`
+            + ` (base 10 → ${Math.round(10 * mod.mult)} HP/turn).</p>`
+            + `<p>Only one Shield Regen Mod can be installed at a time.</p>`,
+        },
+        level:   { value: mod.level },
+        price:   { value: { sp: mod.price } },
+        bulk:    { value: 0 },
+        size:    'tiny',
+        equipped: { carryType: 'worn', inSlot: true },
+        usage:   { value: 'other' },
+        traits:  { value: [], rarity: 'common' },
+        rules:   [],
+      },
+    });
+  }
+
+  ui.notifications.info(
+    `ME Shields | Created ${REGEN_MOD_TIERS.length} Shield Regen Mod items in your Items directory.`
+  );
+}
+
+// ── AUTO-SYNC ─────────────────────────────────────────────────────────────────
+//
+// Called automatically on `ready` (GM only). Recreates world-item templates
+// whenever the module version changes, so GMs never need to run console commands
+// after an update. No-ops if the version hasn't changed since the last sync.
+//
+// Can also be triggered manually: MassEffectShields.sync()
+
+async function syncEffects(version, { force = false } = {}) {
+  const lastVersion = game.settings.get(MODULE_ID, 'lastSyncedVersion');
+  if (!force && lastVersion === version) {
+    console.log(`ME Shields | Effects already synced for v${version} — skipping (pass true to force)`);
+    return;
+  }
+
+  console.log(`ME Shields | Syncing effects for v${version}…`);
+
+  // Delete all world items that belong to this module
+  const stale = game.items.filter(i => {
+    const f = i.flags?.[MODULE_ID];
+    return f && (f.shieldMax != null || f.barrier === true || f.barrierMax != null || f.regenMult != null || f.shieldHpBonus != null);
+  });
+  for (const item of stale) await item.delete();
+
+  // Remove now-empty ME folders
+  for (const folderName of ['Mass Effect Shields', 'Mass Effect Barriers', 'Mass Effect Mods']) {
+    const folder = game.folders.find(f => f.name === folderName && f.type === 'Item');
+    if (folder && folder.contents.length === 0) await folder.delete();
+  }
+
+  await createShieldEffects();
+  await createBarrierEffects();
+  await createShieldHpModEffects();
+  await createRegenModEffects();
+  await game.settings.set(MODULE_ID, 'lastSyncedVersion', version);
+  console.log(`ME Shields | Sync complete.`);
 }
 
 // ── DEBUG UTILITY ─────────────────────────────────────────────────────────────
@@ -570,6 +848,24 @@ function debugShields(actor) {
     console.log('No biotic barrier effect on actor.');
   }
 
+  const hpMod = getShieldHpMod(actor);
+  if (hpMod) {
+    const bonus = hpMod.getFlag(MODULE_ID, 'shieldHpBonus') ?? '(not set)';
+    console.log('Shield HP mod:', hpMod.name, `| slug: ${hpMod.system?.slug}`);
+    console.log(`  shieldHpBonus=${bonus}`);
+  } else {
+    console.log('No shield HP mod on actor.');
+  }
+
+  const regenMod = getRegenMod(actor);
+  if (regenMod) {
+    const mult = regenMod.getFlag(MODULE_ID, 'regenMult') ?? '(not set)';
+    console.log('Regen mod effect:', regenMod.name, `| slug: ${regenMod.system?.slug}`);
+    console.log(`  regenMult=${mult}`);
+  } else {
+    console.log('No regen mod effect on actor.');
+  }
+
   const coverSlug = game.settings.get(MODULE_ID, 'takeCoverSlug');
   const inCover   = hasTakeCover(actor);
   console.log(`Take Cover slug setting: "${coverSlug}" — actor has cover: ${inCover}`);
@@ -578,6 +874,9 @@ function debugShields(actor) {
 
 globalThis.MassEffectShields = {
   createShieldEffects,
+  createShieldHpModEffects,
+  createRegenModEffects,
   createBarrierEffects,
+  sync:  (force = false) => syncEffects(game.modules.get(MODULE_ID)?.version ?? '?', { force }),
   debug: debugShields,
 };

@@ -181,12 +181,20 @@ function hasTakeCover(actor) {
   return actor?.itemTypes?.effect?.some(e => e.system?.slug === slug) ?? false;
 }
 
+function getWhisperRecipients(actor) {
+  const ids = new Set(game.users.filter(u => u.isGM).map(u => u.id));
+  for (const [userId, level] of Object.entries(actor.ownership ?? {})) {
+    if (userId === 'default') continue;
+    if (level >= CONST.DOCUMENT_OWNERSHIP_LEVELS.OWNER) ids.add(userId);
+  }
+  return [...ids];
+}
+
 function postChat(actor, content) {
-  const gmOnly = game.settings.get(MODULE_ID, 'gmOnlyMessages');
   ChatMessage.create({
     speaker: { alias: `⚡ ${actor.name}` },
     content,
-    whisper: gmOnly ? game.users.filter(u => u.isGM).map(u => u.id) : [],
+    whisper: getWhisperRecipients(actor),
   });
 }
 
@@ -198,11 +206,14 @@ const C = {
   restore: '#66bb6a', // green — shields coming back
 };
 
-function shieldBar(current, max, width = 12) {
-  if (max === 0) return `${current}`;
-  const filled = Math.round((current / max) * width);
-  return '█'.repeat(filled) + '░'.repeat(width - filled)
-    + ` <strong>${current}/${max}</strong>`;
+function shieldBar(current, max, color) {
+  const pct = max > 0 ? Math.round((current / max) * 100) : 0;
+  return `<div style="display:flex;align-items:center;gap:6px;margin-top:4px;">
+    <div style="flex:1;background:rgba(0,0,0,0.3);border-radius:3px;height:7px;overflow:hidden;">
+      <div style="width:${pct}%;background:${color};height:100%;border-radius:3px;"></div>
+    </div>
+    <span style="font-size:0.85em;white-space:nowrap;"><strong>${current}/${max}</strong></span>
+  </div>`;
 }
 
 function card(color, body) {
@@ -212,24 +223,24 @@ function card(color, body) {
 
 function rechargeHtml(current, max, restored) {
   return card(C.active,
-    `<strong>⚡ Shields Recharging</strong> +${restored}<br>`
-    + `<span style="color:${C.active};font-family:monospace;">${shieldBar(current, max)}</span>`
+    `<strong>⚡ Shields Recharging</strong> +${restored}`
+    + shieldBar(current, max, C.active)
   );
 }
 
 function restoringHtml(current, max) {
   return card(C.restore,
     `<strong>🛡️ Shields Coming Online</strong><br>`
-    + `Cover taken — kinetic barrier beginning to recharge.<br>`
-    + `<span style="color:${C.restore};font-family:monospace;">${shieldBar(current, max)}</span>`
+    + `Cover taken — kinetic barrier beginning to recharge.`
+    + shieldBar(current, max, C.restore)
   );
 }
 
 function offlineHtml(max) {
   return card(C.broken,
     `<strong>🛡️ Shields Offline</strong><br>`
-    + `Kinetic barrier is depleted. <em>Take Cover to begin recharging.</em><br>`
-    + `<span style="color:${C.broken};font-family:monospace;">${shieldBar(0, max)}</span>`
+    + `Kinetic barrier is depleted. <em>Take Cover to begin recharging.</em>`
+    + shieldBar(0, max, C.broken)
   );
 }
 

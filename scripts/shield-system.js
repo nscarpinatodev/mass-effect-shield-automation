@@ -39,7 +39,7 @@
 //   Disable or remove the module. No persistent hooks remain.
 // ============================================================
 
-const MODULE_ID = 'mass-effect-shields';
+const MODULE_ID = 'mass-effect-shield-automation';
 
 // ── SETTINGS ─────────────────────────────────────────────────────────────────
 
@@ -93,7 +93,7 @@ Hooks.on('deleteItem', async (item, _options, _userId) => {
 
 // ── TURN-START REGEN ──────────────────────────────────────────────────────────
 
-Hooks.on('pf2e.startTurn', async (encounter, combatant) => {
+Hooks.on('pf2e.startTurn', async (_encounter, combatant) => {
   if (!game.user.isGM) return;
   const actor = combatant?.actor;
   if (!actor) return;

@@ -53,14 +53,6 @@ Hooks.once('init', () => {
     default: 'effect-cover',
   });
 
-  game.settings.register(MODULE_ID, 'gmOnlyMessages', {
-    name: 'GM-Only Shield Messages',
-    hint: 'When enabled, shield status messages are whispered to the GM only.',
-    scope: 'world',
-    config: true,
-    type: Boolean,
-    default: true,
-  });
 });
 
 // ── READY ─────────────────────────────────────────────────────────────────────
@@ -72,14 +64,26 @@ Hooks.once('ready', () => {
 
 // ── EFFECT LIFECYCLE ──────────────────────────────────────────────────────────
 
-// When a shield effect is applied to an actor, initialise their Temp HP.
+// When a shield or barrier effect is applied to an actor, initialise its HP.
 Hooks.on('createItem', async (item, _options, _userId) => {
   if (!game.user.isGM) return;
-  if (!isShieldEffect(item)) return;
   const actor = item.parent;
   if (!actor) return;
-  const max = item.getFlag(MODULE_ID, 'shieldMax') ?? 0;
-  if (max > 0) await actor.update({ 'system.attributes.hp.temp': max });
+
+  if (isShieldEffect(item)) {
+    const max = item.getFlag(MODULE_ID, 'shieldMax') ?? 0;
+    if (max > 0) await actor.update({ 'system.attributes.hp.temp': max });
+    return;
+  }
+
+  if (isBioticBarrier(item)) {
+    // If a barrier already exists, remove it — reactivation always resets to full.
+    for (const e of actor.itemTypes.effect.filter(e => isBioticBarrier(e) && e.id !== item.id)) {
+      await e.delete();
+    }
+    const max = item.getFlag(MODULE_ID, 'barrierMax') ?? 0;
+    if (max > 0) await item.setFlag(MODULE_ID, 'barrierCurrent', max);
+  }
 });
 
 // When a shield effect is removed, clear Temp HP.
@@ -89,6 +93,91 @@ Hooks.on('deleteItem', async (item, _options, _userId) => {
   const actor = item.parent;
   if (!actor) return;
   await actor.update({ 'system.attributes.hp.temp': 0 });
+});
+
+// ── DAMAGE ROUTING ────────────────────────────────────────────────────────────
+// Single hook that handles all ME-specific damage rules in priority order:
+//   1. Biotic barriers absorb first
+//   2. Lightning deals double damage to shields
+//   3. Single-hit damage exceeding half shield max collapses shields to 0
+
+Hooks.on('preUpdateActor', (actor, changes, options, _userId) => {
+  if (!game.user.isGM) return;
+
+  const barrier = getBioticBarrier(actor);
+  const shield  = getShieldEffect(actor);
+  if (!barrier && !shield) return;
+
+  // ── Step 1: calculate total incoming damage ──────────────────────────────
+  const currentHP   = actor.system.attributes.hp.value;
+  const currentTemp = actor.system.attributes.hp.temp ?? 0;
+  const newHP   = foundry.utils.getProperty(changes, 'system.attributes.hp.value') ?? currentHP;
+  const newTemp = foundry.utils.getProperty(changes, 'system.attributes.hp.temp') ?? currentTemp;
+
+  const totalDamage = Math.max(0, (currentHP - newHP) + (currentTemp - newTemp));
+  if (totalDamage <= 0) return;
+
+  // ── Step 2: detect lightning damage type ────────────────────────────────
+  // PF2e passes damage context in options — log it once so we can confirm
+  // the correct key if lightning detection needs adjustment.
+  console.log('ME Shields | preUpdateActor options:', JSON.stringify(options ?? {}));
+  const damageTypes = options?.pf2e?.context?.damageTypes
+    ?? options?.pf2e?.damageTypes
+    ?? options?.pf2e?.context?.traits
+    ?? [];
+  const isLightning = Array.isArray(damageTypes) && damageTypes.includes('electricity');
+  if (isLightning) console.log('ME Shields | Lightning damage detected — shields take double damage');
+
+  // ── Step 3: barrier absorption ───────────────────────────────────────────
+  let overflow = totalDamage;
+  if (barrier) {
+    const barrierCurrent = barrier.getFlag(MODULE_ID, 'barrierCurrent') ?? 0;
+    if (barrierCurrent > 0) {
+      const barrierAbsorbs = Math.min(barrierCurrent, overflow);
+      overflow -= barrierAbsorbs;
+      const newBarrier = barrierCurrent - barrierAbsorbs;
+      barrier.setFlag(MODULE_ID, 'barrierCurrent', newBarrier); // fire-and-forget
+      if (newBarrier === 0) {
+        barrier.delete();
+        postChat(actor, barrierDepletedHtml());
+      }
+    }
+  }
+
+  // ── Step 4: shield-specific rules ───────────────────────────────────────
+  const shieldMax = shield?.getFlag(MODULE_ID, 'shieldMax') ?? 0;
+
+  // Damage reaching the shield layer (before special rules).
+  const rawShieldDamage = Math.min(overflow, currentTemp);
+
+  // Lightning: shields absorb double the normal amount, HP overflow unchanged.
+  const effectiveShieldDamage = isLightning
+    ? Math.min(rawShieldDamage * 2, currentTemp)
+    : rawShieldDamage;
+
+  // Massive damage collapse: a single hit dealing more than half shield max
+  // instantly drops shields to 0, even if they would have survived.
+  const massiveThreshold = shieldMax / 2;
+  const isCollapse = shield && currentTemp > 0
+    && effectiveShieldDamage > massiveThreshold;
+
+  const finalShieldHP = isCollapse ? 0 : Math.max(0, currentTemp - effectiveShieldDamage);
+
+  // HP overflow uses original (non-doubled) overflow so lightning doesn't
+  // also double damage to actual HP.
+  const hpDamage = Math.max(0, overflow - currentTemp);
+
+  // ── Step 5: rewrite the changes ─────────────────────────────────────────
+  foundry.utils.setProperty(changes, 'system.attributes.hp.temp',  finalShieldHP);
+  foundry.utils.setProperty(changes, 'system.attributes.hp.value', currentHP - hpDamage);
+
+  // ── Step 6: post messages ────────────────────────────────────────────────
+  if (isLightning && shield && rawShieldDamage > 0) {
+    postChat(actor, lightningShieldHtml(effectiveShieldDamage, currentTemp, finalShieldHP, shieldMax));
+  }
+  if (isCollapse) {
+    postChat(actor, shieldCollapseHtml(shieldMax));
+  }
 });
 
 // ── TURN-START REGEN ──────────────────────────────────────────────────────────
@@ -119,49 +208,63 @@ Hooks.on('pf2e.startTurn', async (first, second) => {
   }
   console.log(`ME Shields | Actor: ${actor.name} (id: ${actor.id})`);
 
-  const shield = getShieldEffect(actor);
-  if (!shield) {
-    console.log(`ME Shields | No shield effect found on ${actor.name} — checking all effects:`);
-    for (const e of (actor.itemTypes?.effect ?? [])) {
-      console.log(`  effect "${e.name}" | slug: ${e.system?.slug} | flags:`, e.flags?.[MODULE_ID]);
-    }
-    return;
-  }
-  console.log(`ME Shields | Shield effect found: "${shield.name}"`);
+  const shield  = getShieldEffect(actor);
+  const barrier = getBioticBarrier(actor);
 
-  const max     = shield.getFlag(MODULE_ID, 'shieldMax')   ?? 0;
-  const regen   = shield.getFlag(MODULE_ID, 'shieldRegen') ?? 0;
-  const current = actor.system.attributes.hp.temp ?? 0;
-  console.log(`ME Shields | max=${max} regen=${regen} current tempHP=${current}`);
-
-  if (max === 0 || regen === 0) {
-    console.warn(`ME Shields | Shield flags missing or zero — max=${max}, regen=${regen}. Were the effects created with createShieldEffects()?`);
+  if (!shield && !barrier) {
+    console.log(`ME Shields | No shield or barrier on ${actor.name} — skipping`);
     return;
   }
 
-  if (current > 0) {
-    if (current >= max) {
-      console.log('ME Shields | Shields already full — posting status');
-      postChat(actor, fullHtml(max));
-    } else {
-      const newTemp  = Math.min(current + regen, max);
-      const restored = newTemp - current;
-      console.log(`ME Shields | Recharging: ${current} → ${newTemp} (+${restored})`);
-      await actor.update({ 'system.attributes.hp.temp': newTemp });
-      postChat(actor, rechargeHtml(newTemp, max, restored));
-    }
+  // ── Shield handling ────────────────────────────────────────────────────────
+  if (shield) {
+    console.log(`ME Shields | Shield effect found: "${shield.name}"`);
 
-  } else {
-    const inCover = hasTakeCover(actor);
-    console.log(`ME Shields | Shields depleted — inCover=${inCover} (checking slug "${game.settings.get(MODULE_ID, 'takeCoverSlug')}")`);
-    if (inCover) {
-      const newTemp = Math.min(regen, max);
-      console.log(`ME Shields | Cover taken — restoring to ${newTemp}`);
-      await actor.update({ 'system.attributes.hp.temp': newTemp });
-      postChat(actor, restoringHtml(newTemp, max));
+    const max     = shield.getFlag(MODULE_ID, 'shieldMax')   ?? 0;
+    const regen   = shield.getFlag(MODULE_ID, 'shieldRegen') ?? 0;
+    const current = actor.system.attributes.hp.temp ?? 0;
+    console.log(`ME Shields | max=${max} regen=${regen} current tempHP=${current}`);
+
+    if (max === 0 || regen === 0) {
+      console.warn(`ME Shields | Shield flags missing or zero — max=${max}, regen=${regen}. Were the effects created with createShieldEffects()?`);
+    } else if (current > 0) {
+      if (current >= max) {
+        console.log('ME Shields | Shields already full — posting status');
+        postChat(actor, fullHtml(max));
+      } else {
+        const newTemp  = Math.min(current + regen, max);
+        const restored = newTemp - current;
+        console.log(`ME Shields | Recharging: ${current} → ${newTemp} (+${restored})`);
+        await actor.update({ 'system.attributes.hp.temp': newTemp });
+        postChat(actor, rechargeHtml(newTemp, max, restored));
+      }
     } else {
-      console.log('ME Shields | No cover — shields remain offline');
-      postChat(actor, offlineHtml(max));
+      const inCover = hasTakeCover(actor);
+      console.log(`ME Shields | Shields depleted — inCover=${inCover} (checking slug "${game.settings.get(MODULE_ID, 'takeCoverSlug')}")`);
+      if (inCover) {
+        const newTemp = Math.min(regen, max);
+        console.log(`ME Shields | Cover taken — restoring to ${newTemp}`);
+        await actor.update({ 'system.attributes.hp.temp': newTemp });
+        postChat(actor, restoringHtml(newTemp, max));
+      } else {
+        console.log('ME Shields | No cover — shields remain offline');
+        postChat(actor, offlineHtml(max));
+      }
+    }
+  }
+
+  // ── Barrier handling ───────────────────────────────────────────────────────
+  if (barrier) {
+    const barrierMax     = barrier.getFlag(MODULE_ID, 'barrierMax')     ?? 0;
+    const barrierCurrent = barrier.getFlag(MODULE_ID, 'barrierCurrent') ?? 0;
+    console.log(`ME Shields | Barrier current=${barrierCurrent}/${barrierMax}`);
+
+    if (barrierCurrent <= 0) {
+      // Safety cleanup — should already be gone via preUpdateActor, but just in case.
+      console.log('ME Shields | Barrier at 0 HP — removing effect');
+      await barrier.delete();
+    } else {
+      postChat(actor, barrierStatusHtml(barrierCurrent, barrierMax));
     }
   }
 });
@@ -175,6 +278,15 @@ function isShieldEffect(item) {
 
 function getShieldEffect(actor) {
   return actor?.itemTypes?.effect?.find(isShieldEffect) ?? null;
+}
+
+function isBioticBarrier(item) {
+  return item.type === 'effect'
+    && item.flags?.[MODULE_ID]?.barrierMax != null;
+}
+
+function getBioticBarrier(actor) {
+  return actor?.itemTypes?.effect?.find(isBioticBarrier) ?? null;
 }
 
 function hasTakeCover(actor) {
@@ -202,9 +314,12 @@ function postChat(actor, content) {
 // ── CHAT HTML ─────────────────────────────────────────────────────────────────
 
 const C = {
-  active:  '#4fc3f7', // cyan  — shields up
-  broken:  '#ef5350', // red   — shields offline
-  restore: '#66bb6a', // green — shields coming back
+  active:   '#4fc3f7', // cyan        — shields up
+  broken:   '#ef5350', // red         — shields offline
+  restore:  '#66bb6a', // green       — shields coming back
+  barrier:  '#ce93d8', // purple      — biotic barrier
+  overload: '#ff6f00', // deep orange — shield collapse
+  lightning:'#fff176', // yellow      — lightning strike
 };
 
 function shieldBar(current, max, color) {
@@ -249,6 +364,37 @@ function offlineHtml(max) {
     `<strong>🛡️ Shields Offline</strong><br>`
     + `Kinetic barrier is depleted. <em>Take Cover to begin recharging.</em>`
     + shieldBar(0, max, C.broken)
+  );
+}
+
+function lightningShieldHtml(shieldDamage, _prevTemp, finalShieldHP, shieldMax) {
+  return card(C.lightning,
+    `<strong>⚡ Lightning Strike — Shields take double damage!</strong><br>`
+    + `Shield damage: <strong>${shieldDamage}</strong> (${shieldDamage / 2} × 2)`
+    + shieldBar(finalShieldHP, shieldMax, C.lightning)
+  );
+}
+
+function shieldCollapseHtml(shieldMax) {
+  return card(C.overload,
+    `<strong>🔴 Shield Overload — Shields Collapsed!</strong><br>`
+    + `Massive hit exceeded overload threshold (${Math.ceil(shieldMax / 2)} damage). `
+    + `<em>Take Cover to restart.</em>`
+    + shieldBar(0, shieldMax, C.overload)
+  );
+}
+
+function barrierStatusHtml(current, max) {
+  return card(C.barrier,
+    `<strong>🔵 Biotic Barrier</strong>`
+    + shieldBar(current, max, C.barrier)
+  );
+}
+
+function barrierDepletedHtml() {
+  return card(C.barrier,
+    `<strong>🔵 Biotic Barrier Collapsed</strong><br>`
+    + `Barrier depleted — spend actions to reactivate.`
   );
 }
 
@@ -316,6 +462,70 @@ async function createShieldEffects() {
   );
 }
 
+// ── BARRIER CREATION UTILITY ──────────────────────────────────────────────────
+//
+// Run from the Foundry browser console:
+//   MassEffectShields.createBarrierEffects()
+//
+// Creates tiered biotic barrier effects based on the formula: 5 × floor(level / 2).
+// Drag the appropriate tier onto any actor to give them a biotic barrier.
+// Barriers activate at full strength and do not regen per turn.
+
+const BARRIER_TIERS = [
+  { tier: 1, name: 'Biotic Barrier — Tier 1', levelEquiv: 2,  max: 5  },
+  { tier: 2, name: 'Biotic Barrier — Tier 2', levelEquiv: 4,  max: 10 },
+  { tier: 3, name: 'Biotic Barrier — Tier 3', levelEquiv: 6,  max: 15 },
+  { tier: 4, name: 'Biotic Barrier — Tier 4', levelEquiv: 8,  max: 20 },
+  { tier: 5, name: 'Biotic Barrier — Tier 5', levelEquiv: 10, max: 25 },
+  { tier: 6, name: 'Biotic Barrier — Tier 6', levelEquiv: 12, max: 30 },
+];
+
+async function createBarrierEffects() {
+  if (!game.user.isGM) {
+    return ui.notifications.warn('ME Shields | Only the GM can create barrier effects.');
+  }
+
+  const folder = await Folder.create({
+    name: 'Mass Effect Barriers',
+    type: 'Item',
+    color: '#ce93d8',
+  });
+
+  for (const tier of BARRIER_TIERS) {
+    await Item.create({
+      name: tier.name,
+      type: 'effect',
+      img: 'icons/magic/light/orb-lightball-blue-purple-pink.webp',
+      folder: folder.id,
+      flags: {
+        [MODULE_ID]: {
+          barrierMax: tier.max,
+        },
+      },
+      system: {
+        slug: `me-biotic-barrier-t${tier.tier}`,
+        description: {
+          value:
+            `<p>A biotic barrier providing <strong>${tier.max} Barrier HP</strong>`
+            + ` (character level ~${tier.levelEquiv}, formula: 5 × ⌊level ÷ 2⌋).</p>`
+            + `<p>Barriers absorb damage before shields and actual HP. They do not`
+            + ` recharge per turn — spend actions to reactivate at full strength.</p>`,
+        },
+        duration: {
+          value:  -1,
+          unit:   'unlimited',
+          expiry: null,
+        },
+        rules: [],
+      },
+    });
+  }
+
+  ui.notifications.info(
+    `ME Shields | Created ${BARRIER_TIERS.length} barrier effects in your Items directory.`
+  );
+}
+
 // ── DEBUG UTILITY ─────────────────────────────────────────────────────────────
 //
 // Run from the Foundry browser console at any time:
@@ -349,13 +559,25 @@ function debugShields(actor) {
     }
   }
 
+  const barrier = getBioticBarrier(actor);
+  if (barrier) {
+    const bMax     = barrier.getFlag(MODULE_ID, 'barrierMax')     ?? '(not set)';
+    const bCurrent = barrier.getFlag(MODULE_ID, 'barrierCurrent') ?? '(not set)';
+    console.log('Biotic barrier effect:', barrier.name, `| slug: ${barrier.system?.slug}`);
+    console.log(`  barrierMax=${bMax}  barrierCurrent=${bCurrent}`);
+    console.log('  Full flags:', barrier.flags?.[MODULE_ID]);
+  } else {
+    console.log('No biotic barrier effect on actor.');
+  }
+
   const coverSlug = game.settings.get(MODULE_ID, 'takeCoverSlug');
   const inCover   = hasTakeCover(actor);
   console.log(`Take Cover slug setting: "${coverSlug}" — actor has cover: ${inCover}`);
-
-  console.log('pf2e.startTurn hooks registered:',
-    Hooks._hooks?.['pf2e.startTurn']?.length ?? 0);
   console.groupEnd();
 }
 
-globalThis.MassEffectShields = { createShieldEffects, debug: debugShields };
+globalThis.MassEffectShields = {
+  createShieldEffects,
+  createBarrierEffects,
+  debug: debugShields,
+};

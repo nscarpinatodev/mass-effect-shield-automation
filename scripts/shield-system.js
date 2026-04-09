@@ -93,33 +93,73 @@ Hooks.on('deleteItem', async (item, _options, _userId) => {
 
 // ── TURN-START REGEN ──────────────────────────────────────────────────────────
 
-Hooks.on('pf2e.startTurn', async (_encounter, combatant) => {
-  if (!game.user.isGM) return;
+// Registered on a named variable so we can confirm it in the console:
+//   Hooks._hooks['pf2e.startTurn']
+Hooks.on('pf2e.startTurn', async (first, second) => {
+  // PF2e changed the argument order in a recent release.
+  // Defensively detect which argument is the combatant by checking for .actor.
+  const combatant = first?.actor  ? first
+                  : second?.actor ? second
+                  : null;
+
+  console.log(`ME Shields | pf2e.startTurn fired`);
+  console.log(`  arg[0]: ${first?.constructor?.name}  name="${first?.name}"  hasActor=${!!first?.actor}`);
+  console.log(`  arg[1]: ${second?.constructor?.name}  name="${second?.name}"  hasActor=${!!second?.actor}`);
+  console.log(`  resolved combatant: ${combatant?.name ?? 'none'}`);
+
+  if (!game.user.isGM) {
+    console.log('ME Shields | Skipping — current user is not GM');
+    return;
+  }
+
   const actor = combatant?.actor;
-  if (!actor) return;
+  if (!actor) {
+    console.log('ME Shields | Skipping — no actor on combatant (neither argument had .actor)');
+    return;
+  }
+  console.log(`ME Shields | Actor: ${actor.name} (id: ${actor.id})`);
 
   const shield = getShieldEffect(actor);
-  if (!shield) return;
+  if (!shield) {
+    console.log(`ME Shields | No shield effect found on ${actor.name} — checking all effects:`);
+    for (const e of (actor.itemTypes?.effect ?? [])) {
+      console.log(`  effect "${e.name}" | slug: ${e.system?.slug} | flags:`, e.flags?.[MODULE_ID]);
+    }
+    return;
+  }
+  console.log(`ME Shields | Shield effect found: "${shield.name}"`);
 
   const max     = shield.getFlag(MODULE_ID, 'shieldMax')   ?? 0;
   const regen   = shield.getFlag(MODULE_ID, 'shieldRegen') ?? 0;
   const current = actor.system.attributes.hp.temp ?? 0;
+  console.log(`ME Shields | max=${max} regen=${regen} current tempHP=${current}`);
+
+  if (max === 0 || regen === 0) {
+    console.warn(`ME Shields | Shield flags missing or zero — max=${max}, regen=${regen}. Were the effects created with createShieldEffects()?`);
+    return;
+  }
 
   if (current > 0) {
-    // Shields are up — apply regen
-    if (current >= max) return; // already full, no message needed
+    if (current >= max) {
+      console.log('ME Shields | Shields already full — skipping regen');
+      return;
+    }
     const newTemp  = Math.min(current + regen, max);
     const restored = newTemp - current;
+    console.log(`ME Shields | Recharging: ${current} → ${newTemp} (+${restored})`);
     await actor.update({ 'system.attributes.hp.temp': newTemp });
     postChat(actor, rechargeHtml(newTemp, max, restored));
 
   } else {
-    // Shields depleted — only recharge if the actor has taken cover
-    if (hasTakeCover(actor)) {
+    const inCover = hasTakeCover(actor);
+    console.log(`ME Shields | Shields depleted — inCover=${inCover} (checking slug "${game.settings.get(MODULE_ID, 'takeCoverSlug')}")`);
+    if (inCover) {
       const newTemp = Math.min(regen, max);
+      console.log(`ME Shields | Cover taken — restoring to ${newTemp}`);
       await actor.update({ 'system.attributes.hp.temp': newTemp });
       postChat(actor, restoringHtml(newTemp, max));
     } else {
+      console.log('ME Shields | No cover — shields remain offline');
       postChat(actor, offlineHtml(max));
     }
   }
@@ -257,4 +297,46 @@ async function createShieldEffects() {
   );
 }
 
-globalThis.MassEffectShields = { createShieldEffects };
+// ── DEBUG UTILITY ─────────────────────────────────────────────────────────────
+//
+// Run from the Foundry browser console at any time:
+//   MassEffectShields.debug()        — inspect the selected/first token
+//   MassEffectShields.debug(actor)   — inspect a specific actor object
+//
+function debugShields(actor) {
+  actor ??= canvas.tokens.controlled[0]?.actor ?? game.combat?.combatant?.actor;
+  if (!actor) {
+    console.warn('ME Shields | debug(): no actor selected and no active combatant');
+    return;
+  }
+
+  console.group(`ME Shields | Debug — ${actor.name}`);
+  console.log('Actor id:', actor.id);
+  console.log('isGM:', game.user.isGM);
+  console.log('tempHP (current):', actor.system.attributes.hp.temp);
+
+  const shield = getShieldEffect(actor);
+  if (shield) {
+    const max   = shield.getFlag(MODULE_ID, 'shieldMax')   ?? '(not set)';
+    const regen = shield.getFlag(MODULE_ID, 'shieldRegen') ?? '(not set)';
+    console.log('Shield effect:', shield.name, `| slug: ${shield.system?.slug}`);
+    console.log(`  shieldMax=${max}  shieldRegen=${regen}`);
+    console.log('  Full flags:', shield.flags?.[MODULE_ID]);
+  } else {
+    console.warn('No shield effect found on actor.');
+    console.log('All effects on actor:');
+    for (const e of (actor.itemTypes?.effect ?? [])) {
+      console.log(`  "${e.name}" | slug: ${e.system?.slug} | module flags:`, e.flags?.[MODULE_ID]);
+    }
+  }
+
+  const coverSlug = game.settings.get(MODULE_ID, 'takeCoverSlug');
+  const inCover   = hasTakeCover(actor);
+  console.log(`Take Cover slug setting: "${coverSlug}" — actor has cover: ${inCover}`);
+
+  console.log('pf2e.startTurn hooks registered:',
+    Hooks._hooks?.['pf2e.startTurn']?.length ?? 0);
+  console.groupEnd();
+}
+
+globalThis.MassEffectShields = { createShieldEffects, debug: debugShields };

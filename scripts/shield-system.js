@@ -218,11 +218,14 @@ Hooks.on('preUpdateActor', (actor, changes, options, _userId) => {
     overflow -= barrierAbsorbs;
     const newBarrier = barrierHPBefore - barrierAbsorbs;
     console.log(`  BARRIER      absorbs ${barrierAbsorbs}  (${barrierHPBefore} → ${newBarrier})  overflow after: ${overflow}`);
-    barrier.setFlag(MODULE_ID, 'barrierCurrent', newBarrier); // fire-and-forget
     if (newBarrier > 0) {
-      barrier.update({ 'system.badge': { type: 'counter', value: newBarrier, max: barrierMax } }); // fire-and-forget
+      // Single update — flag + badge together to avoid two round-trips.
+      barrier.update({
+        [`flags.${MODULE_ID}.barrierCurrent`]: newBarrier,
+        'system.badge': { type: 'counter', value: newBarrier, max: barrierMax },
+      }); // fire-and-forget
     } else {
-      barrier.delete();
+      barrier.delete(); // fire-and-forget — no flag update needed, item is going away
       postChat(actor, barrierDepletedHtml());
     }
   } else if (barrier) {
@@ -654,6 +657,113 @@ async function createBarrierEffects() {
   ui.notifications.info('ME Shields | Created Biotic Barrier effect in your Items directory.');
 }
 
+// ── BARRIER ACTION ITEMS ──────────────────────────────────────────────────────
+//
+// Creates two "Activate Biotic Barrier" items:
+//   • A feat (class feature) for PC characters
+//   • An action for NPC stat blocks
+//
+// Both embed a Biotic Barrier effect that PF2e applies to the actor on use.
+
+async function createBarrierActionItems() {
+  if (!game.user.isGM) {
+    return ui.notifications.warn('ME Shields | Only the GM can create barrier action items.');
+  }
+
+  let folder = game.folders.find(f => f.name === 'Mass Effect Barriers' && f.type === 'Item');
+  if (!folder) {
+    folder = await Folder.create({ name: 'Mass Effect Barriers', type: 'Item', color: '#ce93d8' });
+  }
+
+  // Find the world Biotic Barrier effect so we can point selfEffect at it.
+  // This function must be called after createBarrierEffects().
+  const barrierEffect = game.items.find(i =>
+    i.type === 'effect' && i.flags?.[MODULE_ID]?.barrier === true
+  );
+  const selfEffect = barrierEffect
+    ? { uuid: `Item.${barrierEffect.id}`, name: 'Biotic Barrier' }
+    : null;
+
+  const pcDescription =
+    `<p><strong>Activate Biotic Barrier</strong> <span class="action-glyph">2</span></p><hr>`
+    + `<p><strong>Traits</strong> Biotic, Barrier, Concentrate</p>`
+    + `<p><strong>Requirements</strong> You have the Biotic Barrier class feature or the Biotic Dedication.</p><hr>`
+    + `<p>You project a protective mass effect field around yourself. You gain a biotic barrier with`
+    + ` Hit Points equal to 5 × half your level (rounded down, minimum 5). The barrier absorbs damage`
+    + ` before your shields and actual HP.</p>`
+    + `<p>The barrier lasts until its HP are depleted or you dismiss it. It does not recharge`
+    + ` automatically — you must spend 2 actions to reactivate it at full strength.</p>`
+    + `<p>If your barrier is still active when you reactivate, you replace the remaining barrier HP`
+    + ` with a fresh barrier at full strength.</p><hr>`
+    + `<p><strong>Barrier HP by Level</strong></p>`
+    + `<table><tbody>`
+    + `<tr><td><strong>Level</strong></td><td><strong>Barrier HP</strong></td></tr>`
+    + `<tr><td>1–3</td><td>5</td></tr>`
+    + `<tr><td>4–5</td><td>10</td></tr>`
+    + `<tr><td>6–7</td><td>15</td></tr>`
+    + `<tr><td>8–9</td><td>20</td></tr>`
+    + `<tr><td>10–11</td><td>25</td></tr>`
+    + `<tr><td>12–13</td><td>30</td></tr>`
+    + `<tr><td>14–15</td><td>35</td></tr>`
+    + `<tr><td>16–17</td><td>40</td></tr>`
+    + `<tr><td>18–19</td><td>45</td></tr>`
+    + `<tr><td>20</td><td>50</td></tr>`
+    + `</tbody></table>`;
+
+  const npcDescription =
+    `<p><strong>Activate Biotic Barrier</strong> <span class="action-glyph">2</span></p><hr>`
+    + `<p><strong>Traits</strong> Biotic, Barrier, Concentrate</p><hr>`
+    + `<p>The creature projects a protective mass effect field. It gains a biotic barrier with Hit Points`
+    + ` equal to 5 × half its level (rounded down, minimum 5). The barrier absorbs damage before`
+    + ` shields and actual HP.</p>`
+    + `<p>The barrier lasts until its HP are depleted or dismissed. It does not recharge automatically`
+    + ` — the creature must spend 2 actions to reactivate it at full strength.</p>`
+    + `<p>If the barrier is still active when reactivated, the remaining barrier HP are replaced with`
+    + ` a fresh barrier at full strength.</p>`;
+
+  // PC version — class feature feat
+  await Item.create({
+    name: 'Activate Biotic Barrier',
+    type: 'feat',
+    img: 'icons/magic/lightning/barrier-shield-crackling-orb-pink.webp',
+    folder: folder.id,
+    flags: { [MODULE_ID]: { barrier: true } },
+    system: {
+      slug: 'me-activate-biotic-barrier',
+      description: { value: pcDescription },
+      rules: [],
+      category: 'classfeature',
+      level: { value: 1 },
+      traits: { otherTags: ['biotic', 'barrier'], value: [] },
+      prerequisites: { value: [{ value: 'Biotic Dedication or Biotic Barrier class feature' }] },
+      actionType: { value: 'action' },
+      actions: { value: 2 },
+      selfEffect,
+    },
+  });
+
+  // NPC version — action
+  await Item.create({
+    name: 'Activate Biotic Barrier (NPC)',
+    type: 'action',
+    img: 'icons/magic/lightning/barrier-shield-crackling-orb-pink.webp',
+    folder: folder.id,
+    flags: { [MODULE_ID]: { barrier: true } },
+    system: {
+      slug: 'me-activate-biotic-barrier-npc',
+      description: { value: npcDescription },
+      rules: [],
+      traits: { otherTags: ['biotic', 'barrier'], value: [] },
+      actionType: { value: 'action' },
+      actions: { value: 2 },
+      category: 'interaction',
+      selfEffect,
+    },
+  });
+
+  ui.notifications.info('ME Shields | Created Activate Biotic Barrier items in your Items directory.');
+}
+
 const SHIELD_HP_MOD_TIERS = [
   { tier: 1, bonus: 10, level: 3,  price: 600,   name: 'Shield HP Mod — Tier 1' },
   { tier: 2, bonus: 20, level: 6,  price: 2500,  name: 'Shield HP Mod — Tier 2' },
@@ -798,6 +908,7 @@ async function syncEffects(version, { force = false } = {}) {
 
   await createShieldEffects();
   await createBarrierEffects();
+  await createBarrierActionItems();
   await createShieldHpModEffects();
   await createRegenModEffects();
   await game.settings.set(MODULE_ID, 'lastSyncedVersion', version);
@@ -874,9 +985,10 @@ function debugShields(actor) {
 
 globalThis.MassEffectShields = {
   createShieldEffects,
+  createBarrierEffects,
+  createBarrierActionItems,
   createShieldHpModEffects,
   createRegenModEffects,
-  createBarrierEffects,
   sync:  (force = false) => syncEffects(game.modules.get(MODULE_ID)?.version ?? '?', { force }),
   debug: debugShields,
 };

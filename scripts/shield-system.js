@@ -141,14 +141,15 @@ Hooks.on('pf2e.startTurn', async (first, second) => {
 
   if (current > 0) {
     if (current >= max) {
-      console.log('ME Shields | Shields already full — skipping regen');
-      return;
+      console.log('ME Shields | Shields already full — posting status');
+      postChat(actor, fullHtml(max));
+    } else {
+      const newTemp  = Math.min(current + regen, max);
+      const restored = newTemp - current;
+      console.log(`ME Shields | Recharging: ${current} → ${newTemp} (+${restored})`);
+      await actor.update({ 'system.attributes.hp.temp': newTemp });
+      postChat(actor, rechargeHtml(newTemp, max, restored));
     }
-    const newTemp  = Math.min(current + regen, max);
-    const restored = newTemp - current;
-    console.log(`ME Shields | Recharging: ${current} → ${newTemp} (+${restored})`);
-    await actor.update({ 'system.attributes.hp.temp': newTemp });
-    postChat(actor, rechargeHtml(newTemp, max, restored));
 
   } else {
     const inCover = hasTakeCover(actor);
@@ -219,6 +220,13 @@ function shieldBar(current, max, color) {
 function card(color, body) {
   return `<div style="border-left:3px solid ${color};padding:5px 10px;`
     + `background:${color}18;border-radius:2px;font-size:0.95em;">${body}</div>`;
+}
+
+function fullHtml(max) {
+  return card(C.active,
+    `<strong>⚡ Shields at Full Capacity</strong>`
+    + shieldBar(max, max, C.active)
+  );
 }
 
 function rechargeHtml(current, max, restored) {

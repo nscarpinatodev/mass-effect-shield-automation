@@ -50,7 +50,7 @@ Hooks.once('init', () => {
     scope: 'world',
     config: true,
     type: String,
-    default: 'effect-take-cover',
+    default: 'effect-cover',
   });
 
   game.settings.register(MODULE_ID, 'gmOnlyMessages', {
@@ -186,7 +186,7 @@ function postChat(actor, content) {
   ChatMessage.create({
     speaker: { alias: `⚡ ${actor.name}` },
     content,
-    whisper: gmOnly ? ChatMessage.getWhispers('GM') : [],
+    whisper: gmOnly ? game.users.filter(u => u.isGM).map(u => u.id) : [],
   });
 }
 
